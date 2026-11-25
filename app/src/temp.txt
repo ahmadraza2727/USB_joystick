@@ -1,0 +1,152 @@
+#include "libopencm3/stm32/gpio.h"
+#include "usb_clock_setup.h"
+#include "usb_hid.h"
+#include <libopencm3/cm3/systick.h> // For delay functions
+#include <libopencm3/stm32/f4/rcc.h>
+#include <libopencm3/stm32/flash.h>
+#include <libopencm3/stm32/rcc.h>
+#include <libopencm3/usb/usbd.h>
+#include <stddef.h>
+// #include <stdio.h>
+void keyboard_send(uint8_t modifiers, uint8_t keycode);
+
+void systick_setup(void);
+void delay_ms(uint32_t ms);
+
+void sys_tick_handler(void);
+// static void rcc_setup(void) {
+//   rcc_clock_setup_pll(&rcc_hsi_configs[RCC_CLOCK_3V3_84MHZ]);
+// }
+// #include <libopencm3/stm32/rcc.h>
+// static const struct rcc_clock_scale myclock = {
+//     // .pll_source = RCC_CFGR_PLLSRC_HSI_DIV2, // HSI=16MHz, /2 = 8MHz into
+//     PLL .pll_source = RCC_PLLCFG,     // HSI=16MHz, /2 = 8MHz into PLL
+//     .pll_mul = RCC_CFGR_PLLMUL21, // 8MHz × 21 = 168MHz PLL VCO
+//     .pll_div = 2,                 // /2 = 84MHz sysclk
+//     .ahb_frequency = 84000000,
+//     .apb1_frequency = 42000000,
+//     .apb2_frequency = 84000000,
+//     .flash_waitstates = 2,
+//     .usb_frequency = 48000000};
+//
+static void rcc_setup(void) {
+  // 1. Enable HSI and wait for readiness
+  rcc_osc_on(RCC_HSI);
+  rcc_wait_for_osc_ready(RCC_HSI);
+
+  // 2. Configure PLL
+  // Clear PLL configuration first
+  RCC_PLLCFGR = 0;
+  // Then set new values
+  RCC_PLLCFGR =
+      (4 << RCC_PLLCFGR_PLLM_SHIFT) |  // PLLM=4 (16MHz/4=4MHz)
+      (84 << RCC_PLLCFGR_PLLN_SHIFT) | // PLLN=84 (VCO=4MHz*84=336MHz)
+      (1 << RCC_PLLCFGR_PLLP_SHIFT) |  // PLLP=1 (/4 → 84MHz SYSCLK)
+      (0 << 22) |                      // PLLSRC=HSI (bit 22)
+      (7 << RCC_PLLCFGR_PLLQ_SHIFT);   // PLLQ=7 (336MHz/7=48MHz USB)  // 3.
+                                       // Enable PLL and wait for lock
+  rcc_osc_on(RCC_PLL);
+  rcc_wait_for_osc_ready(RCC_PLL);
+
+  // 4. Set flash latency for 84 MHz operation
+  flash_set_ws(FLASH_ACR_LATENCY_2WS);
+  flash_prefetch_enable();
+
+  // 5. Configure bus prescalers
+
+  // INFO: these are register level modifications
+  //  RCC_CFGR = (RCC_CFGR & ~(0b1111 << 4)) | (0b0000 << 4); // 0b000 = NODIV
+  //  RCC_CFGR = (RCC_CFGR & ~(0b111 << 10)) | (0b100 << 10); // 0b100 = DIV2
+  //  RCC_CFGR = (RCC_CFGR & ~(0b111 << 13)) | (0b000 << 13); // 0b000 = NODIV
+  rcc_set_hpre(RCC_CFGR_HPRE_DIV_NONE); // AHB  = SYSCLK (84MHz)
+  rcc_set_ppre1(RCC_CFGR_PPRE_DIV2);
+  rcc_set_ppre2(RCC_CFGR_PPRE_DIV_NONE);
+
+  // 6. Switch system clock to PLL
+  rcc_set_sysclk_source(RCC_CFGR_SW_PLL);
+  while (rcc_system_clock_source() != RCC_CFGR_SWS_PLL)
+    ;
+
+  // 7. Enable USB peripheral clock
+  // rcc_periph_clock_enable(RCC_OTGFS);
+}
+static void gpio_setup(void) {
+  rcc_periph_clock_enable(RCC_GPIOC);
+  gpio_mode_setup(GPIOC, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO13);
+}
+static void delay_cycles(uint32_t num) {
+  for (uint32_t i = 0; i <= num; i++) {
+    __asm__("nop");
+  }
+}
+void keyboard_send(uint8_t modifiers, uint8_t keycode) {
+  uint8_t report[8] = {modifiers, 0x00, keycode, 0, 0, 0, 0, 0};
+  usb_hid_send_report(report, sizeof(report));
+}
+extern usbd_device *usbd_dev;
+
+bool usb_connected(void) { return usbd_dev != NULL && usb_configured; }
+
+static volatile uint32_t system_millis;
+
+void systick_setup(void) {
+  systick_set_reload(rcc_ahb_frequency / 1000 - 1); // 1ms interrupt
+  systick_set_clocksource(STK_CSR_CLKSOURCE_AHB);
+  systick_counter_enable();
+  systick_interrupt_enable();
+}
+
+void sys_tick_handler(void) { system_millis++; }
+
+void delay_ms(uint32_t ms) {
+  uint32_t wake_time = system_millis + ms;
+  while (wake_time > system_millis)
+    ;
+}
+// int main(void) {
+//   // rcc_setup();
+//   // gpio_setup();
+//   // usb_clock_init(); // GPIO + USB clock setup
+//   // usb_hid_setup();  // Initialize USB HID
+//   //                   // Your setup here
+//   // //
+//   // // uint8_t report[8] = {0};
+//   // while (1) {
+//   //   usb_hid_poll();
+//   //   // gpio_toggle(GPIOC, GPIO13);
+//   //   delay_cycles(84000000 / 8);
+//   //   keyboard_send(0x00, 0x04);
+//   //   // delay_cycles(48000000 / 4);
+//   //   // Main loop
+//   // }
+// }
+
+int main(void) {
+    rcc_setup();
+    systick_setup();
+    gpio_setup();
+    usb_clock_init();
+    usb_hid_setup();
+
+    // Wait for USB connection
+    // uint32_t timeout = 16; // 5 second timeout
+    // while (!usb_connected() && timeout--) {
+    //     usb_hid_poll();
+    //     gpio_toggle(GPIOC, GPIO13); // Blink while waiting
+    //     delay_ms(300);
+    // }
+
+    // Main loop
+    while (1) {
+        usb_hid_poll();
+        
+        if (usb_connected()) {
+            uint8_t report[8] = {0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}; // 'A' key
+            usb_hid_send_report(report, sizeof(report));
+      gpio_toggle(GPIOC, GPIO13);
+            delay_ms(100); // 10Hz refresh
+        }
+        
+        delay_ms(1000);
+    }
+}
